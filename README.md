@@ -28,11 +28,18 @@
 
 -- Save changed file(s).
 
-## You need to pass the next params:
+## Usage scenarios:
 
-### UpdatePackagesAndRedirects.exe "`BasePath`" "`PackageNames`" "`PackageVersion`"
+### You need to pass the next params:
+
+#### UpdatePackagesAndRedirects.exe "`BasePath`" "`PackageNames`" "`PackageVersion`"
+
 -- For `BasePath` - it should be a full path of the top folder of your project(s);
 
 -- For `PackageNames` - target packages) to be updated, separated by a space (' ');
 
 -- For `PackageVersion` - a version that needs to be applied.
+
+For example, if I want to update `Autofac` package to the `7.1.0` version, I'll use the next command:
+
+UpdatePackagesAndRedirects.exe "`C:\my_base_full_path`" "`Autofac`" "`7.1.0`"
