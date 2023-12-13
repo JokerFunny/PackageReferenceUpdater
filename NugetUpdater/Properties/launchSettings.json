@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "NugetUpdater": {
+      "commandName": "Project",
+      "commandLineArgs": "\"D:\\testProject\" \"Autofac\" \"7.0.1\""
+    }
+  }
+}
