@@ -1,6 +1,8 @@
 # PackageReferenceUpdater
  - Tool to update PackageReference + existing BindingRedirects with a proper version.
 
+*NOTE*: The tool actually 'guesses' the needed BindingRecirect to be applied (and only modifies existing), but allows you to update them along with the package itself. So it will save you some time for not complex scenarios and bring a little help for complex ones.
+
 ## The logic is the next:
 
 ### Step 1: Update package versions in csproj files:
