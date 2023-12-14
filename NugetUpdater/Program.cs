@@ -7,8 +7,6 @@ using Newtonsoft.Json.Linq;
 
 using NuGet.Versioning;
 
-using static System.Net.Mime.MediaTypeNames;
-
 class Program
 {
 	private static readonly Regex s_rNuGetInstallOutputRegex = new Regex(@"(Retrieving|Found) package '(?<name>[^']+)\s(?<version>[^']+)'", RegexOptions.Compiled);
@@ -33,17 +31,18 @@ class Program
 
 		string[] csprojFiles = Directory.GetFiles(basePath, "*.csproj", SearchOption.AllDirectories);
 
-		// Step 1: Update package versions in csproj files.
+		Console.WriteLine($"Step 1: Update package versions in csproj files.");
 		UpdatePackageVersions(csprojFiles, packageNames, packageVersion);
 
-		// Step 2: Get the versions to apply for binding redirects.
+		Console.WriteLine($"{Environment.NewLine}Step 2: Get the versions to apply for binding redirects.");
 		List<NuGetPackage> bindingRedirects = GetBindingRedirectVersions(csprojFiles, packageNames, packageVersion);
 
-		// Step 3: Apply binding redirects in app.config/web.config.
+		Console.WriteLine($"{Environment.NewLine}Step 3: Apply binding redirects in app.config/web.config.");
 		ApplyBindingRedirects(csprojFiles, bindingRedirects);
 
 		if (!string.IsNullOrEmpty(tfPath))
 		{
+			Console.WriteLine($"{Environment.NewLine}Step 4: Checkout files using TF.exe.");
 			CheckOutChangedFIles(tfPath);
 		}
 
@@ -116,7 +115,12 @@ class Program
 			}
 		}
 
-		Console.WriteLine("Step 2.2: Get existing versions from project.assets.json.");
+		// TRACING.
+		Console.WriteLine($"{Environment.NewLine}Package (with inner dependencies) versions:");
+		foreach (var item in dependenciesToUpgrade)
+			Console.WriteLine($"Name: [{item.Name}], version: [{item.Version}].");
+
+		Console.WriteLine($"{Environment.NewLine}Step 2.2: Get existing versions from project.assets.json.");
 		List<string> assetsFilePaths = [];
 		foreach (var csprojFile in csprojFiles)
 		{
@@ -126,20 +130,20 @@ class Program
 				assetsFilePaths.Add(assetsFilePath);
 		}
 
-		Dictionary<string, string> existingVersions = [];
+		Dictionary<string, NuGetPackage> existingVersions = [];
 		foreach (string assetsFilePath in assetsFilePaths)
 			GetExistingVersions(assetsFilePath, existingVersions);
 
-		// TRACING.
-		Console.WriteLine("Package (with immer dependencies) versions:");
+		Console.WriteLine($"{Environment.NewLine}Found {existingVersions.Count} dependencies from 'project.assets.json' file(s).");
+
+		Console.WriteLine($"{Environment.NewLine}Step 2.3: Decide on the version to apply for binding redirect.");
+		DecideBindingRedirectVersion(dependenciesToUpgrade, existingVersions);
+
+		Console.WriteLine($"{Environment.NewLine}Package (with inner dependencies) versions after allign with project.assert.json file(s):");
 		foreach (var item in dependenciesToUpgrade)
 			Console.WriteLine($"Name: [{item.Name}], version: [{item.Version}].");
 
-		Console.WriteLine($"Found {existingVersions.Count} dependencies from 'project.assets.json' file(s).");
-
-		Console.WriteLine("Step 2.3: Decide on the version to apply for binding redirect.");
-		DecideBindingRedirectVersion(dependenciesToUpgrade, existingVersions);
-
+		Console.WriteLine($"{Environment.NewLine}Step 2.4: Get full package versions.");
 		UpdateFullPackageVersions(dependenciesToUpgrade, packageNames, packageVersion);
 
 		// TRACING.
@@ -233,33 +237,91 @@ class Program
 		return dependencies;
 	}
 
-	static void GetExistingVersions(string assetsFilePath, Dictionary<string, string> existingVersions)
+	static void GetExistingVersions(string assetsFilePath, Dictionary<string, NuGetPackage> existingVersions)
 	{
-		void __AddItemToCollection(Dictionary<string, string> targetCollection, string dependencyName, string versionToApply)
+		void __AddItemToCollection(Dictionary<string, NuGetPackage> targetCollection, string dependencyName, string versionToApply, VersionRange versionRangeToApply)
 		{
-			// Add dependency to dictionary
 			if (!string.IsNullOrEmpty(versionToApply))
 			{
-				if (targetCollection.TryGetValue(dependencyName, out string existingVersion))
+				if (targetCollection.TryGetValue(dependencyName, out NuGetPackage existingInfo))
 				{
-					// Entry already exists; compare versions and update if the new version is greater
-					if (CompareVersions(versionToApply, existingVersion) > 0)
+					if (!string.IsNullOrEmpty(existingInfo.Version))
 					{
-						targetCollection[dependencyName] = versionToApply;
+						// Entry already exists; compare versions and update if the new version is greater
+						if (CompareVersions(versionToApply, existingInfo.Version) > 0)
+						{
+							existingInfo.Version = versionToApply;
+							targetCollection[dependencyName] = existingInfo;
+						}
+					}
+					else
+					{
+						existingInfo.Version = versionToApply;
 					}
 				}
 				else
 				{
 					// Entry doesn't exist; add it to the dictionary
-					targetCollection[dependencyName] = versionToApply;
+					targetCollection[dependencyName] = new NuGetPackage()
+					{
+						Name = dependencyName,
+						Version = versionToApply
+					};
+				}
+			}
+
+			if (versionRangeToApply != null)
+			{
+				if (targetCollection.TryGetValue(dependencyName, out NuGetPackage existingInfo))
+				{
+					if (existingInfo.SupportedVersions != null)
+					{
+						bool needToChange = false;
+
+						// Build new object with max MinVersion and min MaxVersion.
+						NuGetVersion minVersion = existingInfo.SupportedVersions?.MinVersion;
+						NuGetVersion maxVersion = existingInfo.SupportedVersions?.MaxVersion;
+
+						if (versionRangeToApply.MinVersion > minVersion)
+						{
+							minVersion = versionRangeToApply.MinVersion;
+							needToChange = true;
+						}
+
+						if (versionRangeToApply.MaxVersion < maxVersion)
+						{
+							maxVersion = versionRangeToApply.MaxVersion;
+							needToChange = true;
+						}
+
+						if (needToChange)
+						{
+							VersionRange versionRange = new VersionRange(minVersion: minVersion, maxVersion: maxVersion);
+
+							existingInfo.SupportedVersions = versionRange;
+						}
+					}
+					else
+					{
+						existingInfo.SupportedVersions = versionRangeToApply;
+					}
+				}
+				else
+				{
+					// Entry doesn't exist; add it to the dictionary
+					targetCollection[dependencyName] = new NuGetPackage()
+					{
+						Name = dependencyName,
+						SupportedVersions = versionRangeToApply
+					};
 				}
 			}
 		}
 
-		string __ExtractVersion(JToken versionToken)
+		(string, VersionRange) __ExtractVersion(JToken versionToken)
 		{
 			if (versionToken == null)
-				return string.Empty;
+				return (string.Empty, null);
 
 			string versionString = versionToken.ToString();
 
@@ -271,10 +333,10 @@ class Program
 				VersionRange versionRange = VersionRange.Parse(versionString);
 
 				// Take the lower bound of the version range
-				return versionRange.MaxVersion.Version.ToString();
+				return (string.Empty, versionRange);
 			}
 
-			return versionString;
+			return (versionString, null);
 		}
 
 		try
@@ -291,7 +353,7 @@ class Program
 					string packageVersion = packageNameElementParts[1];
 
 					// Add package to dictionary
-					__AddItemToCollection(existingVersions, packageName, packageVersion);
+					__AddItemToCollection(existingVersions, packageName, packageVersion, null);
 
 					// Extract dependencies for the package
 					var packageDependencies = package.Value["dependencies"]?.Children<JProperty>();
@@ -300,9 +362,9 @@ class Program
 						foreach (var dependency in packageDependencies)
 						{
 							string dependencyName = dependency.Name;
-							string dependencyVersion = __ExtractVersion(dependency.Value);
+							var dependencyVersions = __ExtractVersion(dependency.Value);
 
-							__AddItemToCollection(existingVersions, dependencyName, dependencyVersion);
+							__AddItemToCollection(existingVersions, dependencyName, dependencyVersions.Item1, dependencyVersions.Item2);
 						}
 					}
 				}
@@ -310,21 +372,31 @@ class Program
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"Error parsing JSON: [{ex.Message}].");
+			Console.WriteLine($"Error parsing JSON [{assetsFilePath}]: [{ex.Message}].");
 		}
 	}
 
-	static void DecideBindingRedirectVersion(List<NuGetPackage> dependenciesToUpgrade, Dictionary<string, string> existingVersions)
+	static void DecideBindingRedirectVersion(List<NuGetPackage> dependenciesToUpgrade, Dictionary<string, NuGetPackage> existingVersions)
 	{
 		// Use the existingVersions dictionary to decide the binding redirect version.
 		foreach (var targetDependency in dependenciesToUpgrade)
 		{
-			if (existingVersions.TryGetValue(targetDependency.Name, out string existingVersion))
+			if (existingVersions.TryGetValue(targetDependency.Name, out NuGetPackage existingInfo))
 			{
-				// Update the existing version if the new version is greater.
-				if (CompareVersions(existingVersion, targetDependency.Version) > 0)
+				if (existingInfo.SupportedVersions != null)
 				{
-					targetDependency.Version = existingVersion;
+					if (CompareVersions(existingInfo.Version, targetDependency.Version) > 0)
+						targetDependency.Version = existingInfo.Version;
+
+                    Console.WriteLine($"For the package [{targetDependency.Name}] there was an supported versions range from 'project.assets.json' file(s): [{existingInfo.SupportedVersions}], but applied [{existingInfo.Version}].");
+                }
+				else
+				{
+					// Update the existing version if the new version is greater.
+					if (CompareVersions(existingInfo.Version, targetDependency.Version) > 0)
+					{
+						targetDependency.Version = existingInfo.Version;
+					}
 				}
 			}
 		}
@@ -333,13 +405,19 @@ class Program
 	static void UpdateFullPackageVersions(List<NuGetPackage> bindingRedirects, string[] packageNames, string packageVersion)
 	{
 		foreach (string packageName in packageNames)
+		{
+			Console.WriteLine($"Getting full package version for [{packageName}] package...");
 			UpdateFullPackageVersionsBasedOnNugetPackage(bindingRedirects, packageName, packageVersion);
+		}
 
 		List<NuGetPackage> packagesToProceed = bindingRedirects.Where(p => string.IsNullOrEmpty(p.FullVersion)).ToList();
 		foreach (NuGetPackage packageToProceed in packagesToProceed)
 		{
 			if (string.IsNullOrEmpty(packageToProceed.FullVersion))
+			{
+				Console.WriteLine($"Getting full package version for [{packageToProceed.Name}] package...");
 				UpdateFullPackageVersionsBasedOnNugetPackage(bindingRedirects, packageToProceed.Name, packageToProceed.Version);
+			}
 
 			// That could be that one of the packages updates other(s), so we need to ensure that there is any package for update left.
 			if (!bindingRedirects.Where(p => string.IsNullOrEmpty(p.FullVersion)).Any())
@@ -361,36 +439,39 @@ class Program
 			foreach (NuGetPackage nuGetPackage in nugetCommandResults)
 			{
 				NuGetPackage existingPackageInfo = bindingRedirects.FirstOrDefault(x => x.Name == nuGetPackage.Name);
-				if (!string.IsNullOrEmpty(existingPackageInfo?.FullVersion))
+				if (existingPackageInfo != null)
 				{
-					// Skip the proceeding if the 'FullVersion' already exists.
-					continue;
-				}
-
-				if (nuGetPackage.Version != existingPackageInfo.Version)
-				{
-					// It seems like after parsing the 'project.assets.json' we have another version,
-					// so we don't need to proceed here, but we will use NuGet to get the proper version.
-					continue;
-				}
-
-				// Use 'existingPackageInfo.Version' to try to get a proper package.
-				string packageFolderPath = $"{tempDir}\\{nuGetPackage.Name}.{nuGetPackage.Version}";
-				if (Directory.Exists(packageFolderPath))
-				{
-					string assemblyFullPath = Directory.GetFiles(packageFolderPath, $"{nuGetPackage.Name}.dll", SearchOption.AllDirectories).FirstOrDefault();
-					if (File.Exists(assemblyFullPath))
+					if (!string.IsNullOrEmpty(existingPackageInfo.FullVersion))
 					{
-						// Get the assembly name without loading the assembly
-						AssemblyName assemblyName = AssemblyName.GetAssemblyName(assemblyFullPath);
-
-						// Access the version information
-						string assemblyVersion = assemblyName.Version.ToString();
-
-						existingPackageInfo.FullVersion = assemblyVersion;
+						// Skip the proceeding if the 'FullVersion' already exists.
+						continue;
 					}
+
+					if (nuGetPackage.Version != existingPackageInfo.Version)
+					{
+						// It seems like after parsing the 'project.assets.json' we have another version,
+						// so we don't need to proceed here, but we will use NuGet to get the proper version.
+						continue;
+					}
+
+					// Use 'existingPackageInfo.Version' to try to get a proper package.
+					string packageFolderPath = $"{tempDir}\\{nuGetPackage.Name}.{nuGetPackage.Version}";
+					if (Directory.Exists(packageFolderPath))
+					{
+						string assemblyFullPath = Directory.GetFiles(packageFolderPath, $"{nuGetPackage.Name}.dll", SearchOption.AllDirectories).FirstOrDefault();
+						if (File.Exists(assemblyFullPath))
+						{
+							// Get the assembly name without loading the assembly
+							AssemblyName assemblyName = AssemblyName.GetAssemblyName(assemblyFullPath);
+
+							// Access the version information
+							string assemblyVersion = assemblyName.Version.ToString();
+
+							existingPackageInfo.FullVersion = assemblyVersion;
+						}
+					}
+					// Otherwise, all empty lines (NuGetPackage.FullVersion) would be treated as packages for additional checks.
 				}
-				// Otherwise, all empty lines (NuGetPackage.FullVersion) would be treated as packages for additional checks.
 			}
 		}
 		finally
@@ -416,6 +497,11 @@ class Program
 			if (File.Exists(webConfigFilePath))
 				configFilePaths.Add(webConfigFilePath);
 		}
+
+		// If the FullVersion is empty - the binding redirect for current package is not applyable -> skip it.
+		bindingRedirectVersions = bindingRedirectVersions
+			.Where(x => !string.IsNullOrEmpty(x.FullVersion))
+			.ToList();
 
 		XNamespace ns = "urn:schemas-microsoft-com:asm.v1";
 
@@ -561,12 +647,42 @@ class Program
 
 	public static int CompareVersions(string version1, string version2)
 	{
-		// Version strings are in the format "x.y.z.a".
-		// Convert version strings to Version objects for comparison.
-		Version v1 = new Version(version1);
-		Version v2 = new Version(version2);
+		bool __IsNumeric(string input)
+			=> int.TryParse(input, out _);
 
-		return v1.CompareTo(v2);
+		string[] parts1 = version1.Split('.');
+		string[] parts2 = version2.Split('.');
+
+		int minLength = Math.Min(parts1.Length, parts2.Length);
+
+		for (int i = 0; i < minLength; i++)
+		{
+			if (__IsNumeric(parts1[i]) && __IsNumeric(parts2[i]))
+			{
+				int num1 = int.Parse(parts1[i]);
+				int num2 = int.Parse(parts2[i]);
+
+				if (num1 < num2)
+				{
+					return -1;
+				}
+				else if (num1 > num2)
+				{
+					return 1;
+				}
+			}
+			else
+			{
+				int comparison = string.Compare(parts1[i], parts2[i], StringComparison.OrdinalIgnoreCase);
+				if (comparison != 0)
+				{
+					return comparison;
+				}
+			}
+		}
+
+		// If we haven't returned by now, the versions are equal up to the minimum length
+		return parts1.Length.CompareTo(parts2.Length);
 	}
 
 	class NuGetPackage
@@ -574,5 +690,6 @@ class Program
 		public string Name { get; set; }
 		public string Version { get; set; }
 		public string FullVersion { get; set; }
+		public VersionRange SupportedVersions{ get; set; }
 	}
 }
