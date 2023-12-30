@@ -2,7 +2,7 @@
   "profiles": {
     "NugetUpdater": {
       "commandName": "Project",
-      "commandLineArgs": "\"D:\\testProject\" \"Autofac\" \"7.0.1\""
+      "commandLineArgs": "--basePath \"D:\\testProject\" --tfPath \"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\TeamFoundation\\Team Explorer\\TF.exe\" --detailed"
     }
   }
 }

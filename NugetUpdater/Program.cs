@@ -3,6 +3,8 @@ using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
+using CommandLine;
+
 using Newtonsoft.Json.Linq;
 
 using NuGet.Versioning;
@@ -10,148 +12,133 @@ using NuGet.Versioning;
 class Program
 {
 	private static readonly Regex s_rNuGetInstallOutputRegex = new Regex(@"(Retrieving|Found) package '(?<name>[^']+)\s(?<version>[^']+)'", RegexOptions.Compiled);
-	private static readonly List<string> s_rPathsToUpdate = new List<string>();
-
 	private static readonly Action<string> s_rErrorDataHandler = Console.WriteLine;
+
+	private static readonly List<string> s_rPathsToUpdate = [];
+	private static readonly List<string> s_rPathsToAdd = [];
 
 	private const int TF_ARGUMENT_BLOCK_SIZE = 100;
 
+	private const string DEFAULT_APP_CONFIG_CONTENT = @"<?xml version=""1.0"" encoding=""utf-8""?>
+<configuration>
+  <runtime>
+    <assemblyBinding xmlns=""urn:schemas-microsoft-com:asm.v1"">
+    </assemblyBinding>
+  </runtime>
+</configuration>";
+
 	static void Main(string[] args)
 	{
-		if (args.Length < 3)
+		Options passedParams = Parser.Default.ParseArguments<Options>(args)
+			.WithNotParsed(HandleParseError)
+			.Value;
+
+		List<ProjectInfo> projectInfos = CollectProjectInfos(passedParams.BasePath, passedParams.Detailed);
+
+		Dictionary<string, NuGetPackage> existingVersions = GetExistingPackagesWithVersions(projectInfos, passedParams.Detailed);
+
+		if (!passedParams.ExplicitVersion)
 		{
-			Console.WriteLine("Usage: UpdatePackagesAndRedirects \"<BasePath>\" \"<PackageNames>\" \"<PackageVersion>\"");
-			return;
+			// If 'ExplicitVersion' is not set, align package versions to the latest existing.
+			DecideBindingRedirectVersions(projectInfos, existingVersions, passedParams.Detailed);
 		}
 
-		string basePath = args[0];
-		string[] packageNames = args[1].Split(' ');
-		string packageVersion = args[2];
-		string tfPath = args[3];
+		GetFullPackagesInfo(projectInfos, existingVersions, passedParams.Detailed);
 
-		string[] csprojFiles = Directory.GetFiles(basePath, "*.csproj", SearchOption.AllDirectories);
+		ApplyBindingRedirects(projectInfos);
 
-		Console.WriteLine($"Step 1: Update package versions in csproj files.");
-		UpdatePackageVersions(csprojFiles, packageNames, packageVersion);
-
-		Console.WriteLine($"{Environment.NewLine}Step 2: Get the versions to apply for binding redirects.");
-		List<NuGetPackage> bindingRedirects = GetBindingRedirectVersions(csprojFiles, packageNames, packageVersion);
-
-		Console.WriteLine($"{Environment.NewLine}Step 3: Apply binding redirects in app.config/web.config.");
-		ApplyBindingRedirects(csprojFiles, bindingRedirects);
-
-		if (!string.IsNullOrEmpty(tfPath))
-		{
-			Console.WriteLine($"{Environment.NewLine}Step 4: Checkout files using TF.exe.");
-			CheckOutChangedFIles(tfPath);
-		}
+		if (!string.IsNullOrEmpty(passedParams.TfPath))
+			CheckOutChangedFIles(passedParams.TfPath, passedParams.Detailed);
 
 		Console.WriteLine("Package versions updated and binding redirects applied successfully.");
 	}
 
-	static void UpdatePackageVersions(string[] csprojFiles, string[] packageNames, string packageVersion)
+	static List<ProjectInfo> CollectProjectInfos(string basePath, bool detailed)
 	{
-		foreach (var csprojFile in csprojFiles)
-		{
-			string content = File.ReadAllText(csprojFile);
-			string updatedContent = string.Empty;
+		Console.WriteLine($"Step 1: Collect project files info.");
+		List<ProjectInfo> result = [];
 
-			foreach (var packageName in packageNames)
-			{
-				// Updated regular expression to handle both short and long versions.
-				string multiLinePattern = $@"<PackageReference Include=""{packageName}""[^>]*>\s*<Version>[^<]*<\/Version>\s*<\/PackageReference>";
-				string singleLinePattern = $"<PackageReference Include=\"{packageName}\" Version=\"[^\"]+\".*?>";
-
-				// We'll use a single line format, which is a more modern.
-				string replacement = $"<PackageReference Include=\"{packageName}\" Version=\"{packageVersion}\" />";
-
-				updatedContent = Regex.Replace(content, singleLinePattern, replacement);
-				updatedContent = Regex.Replace(updatedContent, multiLinePattern, replacement, RegexOptions.Singleline);
-			}
-
-			if (content != updatedContent)
-			{
-				try
-				{
-					ClearAttributes(csprojFile);
-					File.WriteAllText(csprojFile, updatedContent);
-
-					Console.WriteLine($"Updated [{csprojFile}] with project(s): [{string.Join("; ", packageNames)}] with version: [{packageVersion}].");
-
-					s_rPathsToUpdate.Add(csprojFile);
-				}
-				catch (Exception ex)
-				{
-					Console.WriteLine($"Update of the file [{csprojFile}] failed! Error message: [{ex.Message}].");
-				}
-			}
-			else
-			{
-				Console.WriteLine($"No changes made to [{csprojFile}].");
-			}
-		}
-	}
-
-	static List<NuGetPackage> GetBindingRedirectVersions(string[] csprojFiles, string[] packageNames, string packageVersion)
-	{
-		Console.WriteLine("Step 2.1: Get inner dependencies of the specified package version.");
-		List<NuGetPackage> dependenciesToUpgrade = [];
-		foreach (var packageName in packageNames)
-		{
-			List<NuGetPackage> innerDependencies = GetInnerDependencies(packageName, packageVersion);
-			foreach (NuGetPackage dependency in innerDependencies)
-			{
-				NuGetPackage existingItem = dependenciesToUpgrade.FirstOrDefault(x => x.Name == dependency.Name);
-				if (existingItem != null)
-				{
-					// Update the existing version if the new version is greater.
-					if (CompareVersions(dependency.Version, existingItem.Version) > 0)
-					{
-						existingItem.Version = dependency.Version;
-					}
-				}
-				else
-					dependenciesToUpgrade.Add(dependency);
-			}
-		}
-
-		// TRACING.
-		Console.WriteLine($"{Environment.NewLine}Package (with inner dependencies) versions:");
-		foreach (var item in dependenciesToUpgrade)
-			Console.WriteLine($"Name: [{item.Name}], version: [{item.Version}].");
-
-		Console.WriteLine($"{Environment.NewLine}Step 2.2: Get existing versions from project.assets.json.");
-		List<string> assetsFilePaths = [];
+		string[] csprojFiles = Directory.GetFiles(basePath, "*.csproj", SearchOption.AllDirectories);
 		foreach (var csprojFile in csprojFiles)
 		{
 			string directoryPath = Path.GetDirectoryName(csprojFile);
-			string assetsFilePath = Path.Combine(directoryPath, "obj", "project.assets.json");
-			if (File.Exists(assetsFilePath))
-				assetsFilePaths.Add(assetsFilePath);
+
+			var projectToProcess = new ProjectInfo()
+			{
+				Name = Path.GetFileNameWithoutExtension(csprojFile),
+				ProjectFilePath = csprojFile,
+				AssetsFilePath = Path.Combine(directoryPath, "obj", "project.assets.json")
+			};
+
+			List<string> configFilePaths = Directory.GetFiles(directoryPath, "*", SearchOption.AllDirectories)
+				.Where(file => !file.Contains("\\bin\\"))
+				.Where(file => file.EndsWith("app.config", StringComparison.OrdinalIgnoreCase) || file.EndsWith("web.config", StringComparison.OrdinalIgnoreCase))
+				.ToList();
+
+			if (configFilePaths.Count == 0)
+			{
+				projectToProcess.AddNewAppConfigFile = true;
+				projectToProcess.ConfigFilePaths = [Path.Combine(directoryPath, "app.config")];
+			}
+			else
+			{
+				// Add additional config file paths if any.
+				projectToProcess.ConfigFilePaths = new List<string>(configFilePaths);
+			}
+
+			result.Add(projectToProcess);
 		}
 
+		Console.WriteLine($"Found [{result.Count}] projects to process");
+
+		if (detailed)
+		{
+			foreach (var projectInfo in result)
+			{
+				Console.WriteLine($"{Environment.NewLine}Project name: [{projectInfo.Name}];" +
+					$"{Environment.NewLine}project file path: [{projectInfo.ProjectFilePath}];" +
+					$"{Environment.NewLine}project.assets.json file path: [{projectInfo.AssetsFilePath}];" +
+					$"{Environment.NewLine}config file path(s) to be {(projectInfo.AddNewAppConfigFile ? "created" : "updated")}: " +
+					$"[{Environment.NewLine}    {string.Join($";{Environment.NewLine}    ", projectInfo.ConfigFilePaths)}{Environment.NewLine}].");
+			}
+		}
+		else
+			Console.WriteLine($"Project names: [{string.Join("; ", result.Select(x => x.Name))}]");
+
+		return result;
+	}
+
+	static Dictionary<string, NuGetPackage> GetExistingPackagesWithVersions(List<ProjectInfo> projectInfos, bool detailed)
+	{
+		Console.WriteLine($"{Environment.NewLine}Step 2: Get existing versions from project.assets.json.");
 		Dictionary<string, NuGetPackage> existingVersions = [];
-		foreach (string assetsFilePath in assetsFilePaths)
-			GetExistingVersions(assetsFilePath, existingVersions);
 
-		Console.WriteLine($"{Environment.NewLine}Found {existingVersions.Count} dependencies from 'project.assets.json' file(s).");
+		foreach (ProjectInfo projectInfo in projectInfos)
+		{
+			if (File.Exists(projectInfo.AssetsFilePath))
+			{
+				Dictionary<string, NuGetPackage> dependentPackages = GetExistingPackageVersions(projectInfo.AssetsFilePath, existingVersions, detailed);
+				projectInfo.UsedPackages = dependentPackages.Select(x => x.Value).ToList();
 
-		Console.WriteLine($"{Environment.NewLine}Step 2.3: Decide on the version to apply for binding redirect.");
-		DecideBindingRedirectVersion(dependenciesToUpgrade, existingVersions);
+				if (detailed)
+				{
+					Console.WriteLine($"{Environment.NewLine}Total packages count: {existingVersions.Count};" +
+						$"{Environment.NewLine}Project [{projectInfo.Name}] dependencies:" +
+						$"{Environment.NewLine}[");
 
-		Console.WriteLine($"{Environment.NewLine}Package (with inner dependencies) versions after allign with project.assert.json file(s):");
-		foreach (var item in dependenciesToUpgrade)
-			Console.WriteLine($"Name: [{item.Name}], version: [{item.Version}].");
+					foreach (NuGetPackage dependentPackage in projectInfo.UsedPackages)
+						Console.WriteLine($"    Name: [{dependentPackage.Name}], version: [{dependentPackage.Version}];");
 
-		Console.WriteLine($"{Environment.NewLine}Step 2.4: Get full package versions.");
-		UpdateFullPackageVersions(dependenciesToUpgrade, packageNames, packageVersion);
+					Console.WriteLine("]");
+				}
+				else
+					Console.WriteLine($"Project [{projectInfo.Name}] was processed: found [{projectInfo.UsedPackages.Count}] dependant packages.");
+			}
+			else
+				Console.WriteLine($"project.assets.json file by path [{projectInfo.AssetsFilePath}] doesn't exist. Seems like the project [{projectInfo.Name}] haven't built yet!");
+		}
 
-		// TRACING.
-		Console.WriteLine($"{Environment.NewLine}Versions to apply:");
-		foreach (var item in dependenciesToUpgrade)
-			Console.WriteLine($"Name: [{item.Name}], version: [{item.Version}], full version: [{item.FullVersion}].");
-
-		return dependenciesToUpgrade;
+		return existingVersions;
 	}
 
 	static string GetPackageFromNuget(string packageName, string packageVersion, string outputDirectory)
@@ -190,28 +177,10 @@ class Program
 			process.WaitForExit();
 
 			if (process.ExitCode != 0)
-				throw new InvalidOperationException($"The command 'nuget $\"install {{packageName}} -Version {{packageVersion}} -OutputDirectory {{tempDir}} -Verbosity detailed\"' exited with error code {process.ExitCode}");
+				throw new InvalidOperationException($"The command 'nuget install {{packageName}} -Version {{packageVersion}} -OutputDirectory {{tempDir}} -Verbosity detailed' exited with error code {process.ExitCode}");
 		}
 
 		return result;
-	}
-
-	static List<NuGetPackage> GetInnerDependencies(string packageName, string packageVersion)
-	{
-		string tempDir = Path.Combine(Path.GetTempPath(), $"{packageName}_{Guid.NewGuid()}");
-		Directory.CreateDirectory(tempDir);
-
-		try
-		{
-			string output = GetPackageFromNuget(packageName, packageVersion, tempDir);
-
-			return ParseNuGetOutput(output);
-		}
-		finally
-		{
-			ClearAttributes(tempDir);
-			Directory.Delete(tempDir, true);
-		}
 	}
 
 	static List<NuGetPackage> ParseNuGetOutput(string output)
@@ -237,7 +206,7 @@ class Program
 		return dependencies;
 	}
 
-	static void GetExistingVersions(string assetsFilePath, Dictionary<string, NuGetPackage> existingVersions)
+	static Dictionary<string, NuGetPackage> GetExistingPackageVersions(string assetsFilePath, Dictionary<string, NuGetPackage> existingVersions, bool detailed)
 	{
 		void __AddItemToCollection(Dictionary<string, NuGetPackage> targetCollection, string dependencyName, string versionToApply, VersionRange versionRangeToApply)
 		{
@@ -339,6 +308,9 @@ class Program
 			return (versionString, null);
 		}
 
+		Dictionary<string, NuGetPackage> result = [];
+		Dictionary<string, List<NuGetPackage>> notPackageDependencies = [];
+
 		try
 		{
 			string jsonContent = File.ReadAllText(assetsFilePath);
@@ -346,25 +318,55 @@ class Program
 
 			foreach (var target in jsonObject["targets"].Children<JProperty>())
 			{
-				foreach (var package in target.Value.Children<JProperty>())
+				foreach (var reference in target.Value.Children<JProperty>())
 				{
-					string[] packageNameElementParts = package.Name?.Split('/');
-					var packageName = packageNameElementParts[0];
-					string packageVersion = packageNameElementParts[1];
+					string[] referenceNameElementParts = reference.Name?.Split('/');
+					var referenceName = referenceNameElementParts[0];
+					string referenceVersion = referenceNameElementParts[1];
+					string referenceType = reference.Value["type"].ToString();
 
-					// Add package to dictionary
-					__AddItemToCollection(existingVersions, packageName, packageVersion, null);
-
-					// Extract dependencies for the package
-					var packageDependencies = package.Value["dependencies"]?.Children<JProperty>();
-					if (packageDependencies != null)
+					// Check that this is a NuGet package.
+					if (referenceType == "package")
 					{
-						foreach (var dependency in packageDependencies)
-						{
-							string dependencyName = dependency.Name;
-							var dependencyVersions = __ExtractVersion(dependency.Value);
+						// Add package to dictionary
+						__AddItemToCollection(result, referenceName, referenceVersion, null);
+						__AddItemToCollection(existingVersions, referenceName, referenceVersion, null);
 
-							__AddItemToCollection(existingVersions, dependencyName, dependencyVersions.Item1, dependencyVersions.Item2);
+						// Extract dependencies for the package
+						var packageDependencies = reference.Value["dependencies"]?.Children<JProperty>();
+						if (packageDependencies != null)
+						{
+							foreach (var dependency in packageDependencies)
+							{
+								string dependencyName = dependency.Name;
+								var dependencyVersions = __ExtractVersion(dependency.Value);
+
+								__AddItemToCollection(result, dependencyName, dependencyVersions.Item1, dependencyVersions.Item2);
+								__AddItemToCollection(existingVersions, dependencyName, dependencyVersions.Item1, dependencyVersions.Item2);
+							}
+						}
+					}
+					else
+					{
+						if (detailed)
+						{
+							if (notPackageDependencies.TryGetValue(referenceType, out List<NuGetPackage> infoToUpdate))
+							{
+								infoToUpdate.Add(new NuGetPackage()
+								{
+									Name = referenceName,
+									Version = referenceVersion
+								});
+							}
+							else
+							{
+								notPackageDependencies.Add(referenceType, [
+									new NuGetPackage()
+									{
+										Name = referenceName,
+										Version = referenceVersion
+									}]);
+							}
 						}
 					}
 				}
@@ -372,61 +374,160 @@ class Program
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"Error parsing JSON [{assetsFilePath}]: [{ex.Message}].");
+			LogError($"Error parsing JSON [{assetsFilePath}]: [{ex.Message}].");
+		}
+
+		if (detailed)
+		{
+			foreach (KeyValuePair<string, List<NuGetPackage>> referenceType in notPackageDependencies)
+			{
+				Console.WriteLine($"In the file [{assetsFilePath}] found ['{referenceType.Key}'] which is skipped as we have an aim on 'package' type only. Found packages: [");
+
+				foreach (NuGetPackage dependency in referenceType.Value)
+					Console.WriteLine($"    Reference name: [{dependency.Name}], version: [{dependency.Version}];");
+
+				Console.WriteLine("].");
+			}
+		}
+
+		return result;
+	}
+
+	static void DecideBindingRedirectVersions(List<ProjectInfo> projectInfos, Dictionary<string, NuGetPackage> existingPackages, bool detailed)
+	{
+		Console.WriteLine($"{Environment.NewLine}Step 2.1: Decide on the version to apply for binding redirects.");
+
+		// Use the existingVersions dictionary to decide the binding redirect version.
+		foreach (ProjectInfo projectInfo in projectInfos)
+		{
+			if (detailed)
+				Console.WriteLine($"{Environment.NewLine}Updating package versions of the [{projectInfo.Name}] project...");
+
+			foreach (NuGetPackage dependantPackage in projectInfo.UsedPackages)
+			{
+				NuGetPackage existingInfo = existingPackages[dependantPackage.Name];
+				
+				// Update the existing version if the new version is greater.
+				if (CompareVersions(existingInfo.Version, dependantPackage.Version) > 0)
+				{
+					if (detailed)
+						Console.WriteLine($"Version for the package [{dependantPackage.Name}] updated from [{dependantPackage.Version}] to [{existingInfo.Version}].");
+
+					dependantPackage.Version = existingInfo.Version;
+				}
+
+				if (existingInfo.SupportedVersions != null)
+					Console.WriteLine($"For the package [{dependantPackage.Name}] there was an supported versions range from 'project.assets.json' file(s): [{existingInfo.SupportedVersions}]; applied version: [{existingInfo.Version}].");
+			}
 		}
 	}
 
-	static void DecideBindingRedirectVersion(List<NuGetPackage> dependenciesToUpgrade, Dictionary<string, NuGetPackage> existingVersions)
+	static void GetFullPackagesInfo(List<ProjectInfo> projectInfos, Dictionary<string, NuGetPackage> existingPackages, bool detailed)
 	{
-		// Use the existingVersions dictionary to decide the binding redirect version.
-		foreach (var targetDependency in dependenciesToUpgrade)
-		{
-			if (existingVersions.TryGetValue(targetDependency.Name, out NuGetPackage existingInfo))
-			{
-				if (existingInfo.SupportedVersions != null)
-				{
-					if (CompareVersions(existingInfo.Version, targetDependency.Version) > 0)
-						targetDependency.Version = existingInfo.Version;
+		Stopwatch stopwatch = new();
+		stopwatch.Start();
+		Console.WriteLine($"{Environment.NewLine}Step 3: Get full packages info.");
+		Dictionary<string, List<PackageVersionInfo>> knownPackageVersions = [];
+		Dictionary<string, List<string>> knownPackagesToSkip = [];
 
-                    Console.WriteLine($"For the package [{targetDependency.Name}] there was an supported versions range from 'project.assets.json' file(s): [{existingInfo.SupportedVersions}], but applied [{existingInfo.Version}].");
-                }
-				else
+		// TODO: parallelize.
+		// Get full package versions for the all existing packages (if ExplicitVersion is not set, this cycle would be enought).
+		foreach (var existingPackage in existingPackages)
+		{
+			if (knownPackageVersions.TryGetValue(existingPackage.Key, out List<PackageVersionInfo> existingVersionInfos) 
+				&& existingVersionInfos.FirstOrDefault(x => x.Version == existingPackage.Value.Version) != null)
+			{
+				Console.WriteLine($"Full info for [{existingPackage.Key}] package of version [{existingPackage.Value.Version}] already obtained.");
+			}
+			else if (knownPackagesToSkip.TryGetValue(existingPackage.Key, out List<string> knownVersions) && knownVersions.Contains(existingPackage.Value.Version))
+			{
+				Console.WriteLine($"[SKIP]: Full info for [{existingPackage.Key}] package of version [{existingPackage.Value.Version}] can't be obtained.");
+			}
+			else
+			{
+				Console.WriteLine($"Getting full package info for [{existingPackage.Key}] package of version [{existingPackage.Value.Version}]...");
+				UpdatePackageInfosBasedOnNugetPackage(existingPackage.Key, existingPackage.Value.Version, knownPackageVersions, knownPackagesToSkip, detailed);
+			}
+		}
+
+		foreach (ProjectInfo projectInfo in projectInfos)
+		{
+			foreach (NuGetPackage packageToProcess in projectInfo.UsedPackages)
+			{
+				PackageVersionInfo existingVersion = knownPackageVersions[packageToProcess.Name].FirstOrDefault(x => x.Version == packageToProcess.Version);
+				if (existingVersion == null)
 				{
-					// Update the existing version if the new version is greater.
-					if (CompareVersions(existingInfo.Version, targetDependency.Version) > 0)
+					if (knownPackagesToSkip.TryGetValue(packageToProcess.Name, out List<string> value) && value.First(x => x == packageToProcess.Version) != null)
 					{
-						targetDependency.Version = existingInfo.Version;
+						// do nothing...
+						// log all skipped packages at the end.
+					}
+					else
+					{
+						Console.WriteLine($"[Additional try]: Getting full package info for [{packageToProcess.Name}] package of version [{packageToProcess.Version}]...");
+						UpdatePackageInfosBasedOnNugetPackage(packageToProcess.Name, packageToProcess.Version, knownPackageVersions, knownPackagesToSkip, detailed);
+
+						existingVersion = knownPackageVersions[packageToProcess.Name].FirstOrDefault(x => x.Version == packageToProcess.Version);
+						if (existingVersion != null)
+						{
+							packageToProcess.FullVersion = existingVersion.FullVersion;
+							packageToProcess.PublicKeyToken = existingVersion.PublicKeyToken;
+							packageToProcess.Culture = existingVersion.Culture;
+						}
 					}
 				}
+				else
+				{
+					packageToProcess.FullVersion = existingVersion.FullVersion;
+					packageToProcess.PublicKeyToken = existingVersion.PublicKeyToken;
+					packageToProcess.Culture = existingVersion.Culture;
+				}
 			}
-		}
-	}
 
-	static void UpdateFullPackageVersions(List<NuGetPackage> bindingRedirects, string[] packageNames, string packageVersion)
-	{
-		foreach (string packageName in packageNames)
-		{
-			Console.WriteLine($"Getting full package version for [{packageName}] package...");
-			UpdateFullPackageVersionsBasedOnNugetPackage(bindingRedirects, packageName, packageVersion);
-		}
-
-		List<NuGetPackage> packagesToProceed = bindingRedirects.Where(p => string.IsNullOrEmpty(p.FullVersion)).ToList();
-		foreach (NuGetPackage packageToProceed in packagesToProceed)
-		{
-			if (string.IsNullOrEmpty(packageToProceed.FullVersion))
+			if (detailed)
 			{
-				Console.WriteLine($"Getting full package version for [{packageToProceed.Name}] package...");
-				UpdateFullPackageVersionsBasedOnNugetPackage(bindingRedirects, packageToProceed.Name, packageToProceed.Version);
-			}
+				Console.WriteLine($"{Environment.NewLine}Project [{projectInfo.Name}] dependencies info:" +
+					$"{Environment.NewLine}[");
 
-			// That could be that one of the packages updates other(s), so we need to ensure that there is any package for update left.
-			if (!bindingRedirects.Where(p => string.IsNullOrEmpty(p.FullVersion)).Any())
-				break;
+				foreach (NuGetPackage dependentPackage in projectInfo.UsedPackages)
+					Console.WriteLine($"    Name: [{dependentPackage.Name}], version: [{dependentPackage.Version}], full version: [{dependentPackage.FullVersion}], " +
+						$"publick key token: [{dependentPackage.PublicKeyToken}], culture: [{dependentPackage.Culture}];");
+
+				Console.WriteLine("]");
+			}
+			else
+				Console.WriteLine($"Project [{projectInfo.Name}] was processed.");
 		}
+
+		if (detailed)
+		{
+			Console.WriteLine($"{Environment.NewLine}Skipped [{knownPackagesToSkip.Count}] dependencies:");
+
+			foreach (string packageName in knownPackagesToSkip.Keys)
+				Console.WriteLine($"    Package [{packageName}] skipped with version(s): {string.Join($"; ", knownPackagesToSkip[packageName])}];");
+		}
+
+		stopwatch.Stop();
+		Console.WriteLine($"Elapsed time: [{stopwatch.Elapsed}]");
 	}
 
-	static void UpdateFullPackageVersionsBasedOnNugetPackage(List<NuGetPackage> bindingRedirects, string packageName, string packageVersion)
+	static void UpdatePackageInfosBasedOnNugetPackage(string packageName, string packageVersion, Dictionary<string, List<PackageVersionInfo>> packagesToUpdate, Dictionary<string, List<string>> packagesToSkip, bool detailed)
 	{
+		static string __GetPublicKeyToken(AssemblyName assemblyName)
+		{
+			string result = string.Empty;
+
+			var publickKeyTokenBytes = assemblyName.GetPublicKeyToken();
+
+			if (publickKeyTokenBytes?.Length > 0)
+			{
+				for (int i = 0; i < publickKeyTokenBytes.Length; i++)
+					result += string.Format("{0:x2}", publickKeyTokenBytes[i]);
+			}
+
+			return result;
+		}
+
 		string tempDir = Path.Combine(Path.GetTempPath(), $"{packageName}_{Guid.NewGuid()}");
 		Directory.CreateDirectory(tempDir);
 
@@ -438,137 +539,192 @@ class Program
 
 			foreach (NuGetPackage nuGetPackage in nugetCommandResults)
 			{
-				NuGetPackage existingPackageInfo = bindingRedirects.FirstOrDefault(x => x.Name == nuGetPackage.Name);
-				if (existingPackageInfo != null)
+				if (!packagesToUpdate.ContainsKey(nuGetPackage.Name))
+					packagesToUpdate.Add(nuGetPackage.Name, []);
+
+				PackageVersionInfo existingPackageVersionInfo = packagesToUpdate[nuGetPackage.Name].FirstOrDefault(x => x.Version == nuGetPackage.Version);
+				if (existingPackageVersionInfo == null)
 				{
-					if (!string.IsNullOrEmpty(existingPackageInfo.FullVersion))
-					{
-						// Skip the proceeding if the 'FullVersion' already exists.
-						continue;
-					}
-
-					if (nuGetPackage.Version != existingPackageInfo.Version)
-					{
-						// It seems like after parsing the 'project.assets.json' we have another version,
-						// so we don't need to proceed here, but we will use NuGet to get the proper version.
-						continue;
-					}
-
-					// Use 'existingPackageInfo.Version' to try to get a proper package.
+					// Use 'nuGetPackage.Version' to try to get a proper package version.
 					string packageFolderPath = $"{tempDir}\\{nuGetPackage.Name}.{nuGetPackage.Version}";
 					if (Directory.Exists(packageFolderPath))
 					{
+						// TODO: add platform-specific check. Do this after changing the logic of project.assets.json file parsing to contain platform-specific info.
 						string assemblyFullPath = Directory.GetFiles(packageFolderPath, $"{nuGetPackage.Name}.dll", SearchOption.AllDirectories).FirstOrDefault();
 						if (File.Exists(assemblyFullPath))
 						{
-							// Get the assembly name without loading the assembly
+							// Get the assembly name without loading the assembly.
 							AssemblyName assemblyName = AssemblyName.GetAssemblyName(assemblyFullPath);
 
-							// Access the version information
+							// Access the version information.
 							string assemblyVersion = assemblyName.Version.ToString();
+							string publicKeyToken = __GetPublicKeyToken(assemblyName);
+							string culture = string.IsNullOrEmpty(assemblyName.CultureName) ? "neutral" : assemblyName.CultureName;
 
-							existingPackageInfo.FullVersion = assemblyVersion;
+							packagesToUpdate[nuGetPackage.Name].Add(new PackageVersionInfo()
+							{
+								Version = nuGetPackage.Version,
+								FullVersion = assemblyVersion,
+								PublicKeyToken = publicKeyToken,
+								Culture = culture
+							});
+
+							if (detailed)
+								Console.WriteLine($"    Obtained full info for the package [{nuGetPackage.Name}] with version [{nuGetPackage.Version}]: full package version - [{assemblyVersion}], publick key token - [{publicKeyToken}], culture - [{culture}].");
+						}
+						else
+						{
+							if (packagesToSkip.TryGetValue(nuGetPackage.Name, out List<string> versionsToUpdate))
+							{
+								if (!versionsToUpdate.Contains(nuGetPackage.Version))
+									versionsToUpdate.Add(nuGetPackage.Version);
+							}
+							else
+								packagesToSkip.Add(nuGetPackage.Name, [nuGetPackage.Version]);
+
+							if (detailed)
+								Console.WriteLine($"    SKIPPED: Full info for the package [{nuGetPackage.Name}] with version [{nuGetPackage.Version}] can't be received, packaged added to exclude list.");
 						}
 					}
-					// Otherwise, all empty lines (NuGetPackage.FullVersion) would be treated as packages for additional checks.
+					else
+					{
+						LogWarning($"Can't find directory by path [{packageFolderPath}]." +
+							$"Directory content: [{Environment.NewLine}    {string.Join($";{Environment.NewLine}    ", new DirectoryInfo(tempDir).GetDirectories().Select(x => x.Name))}{Environment.NewLine}]");
+
+						if (packagesToSkip.TryGetValue(nuGetPackage.Name, out List<string> versionsToUpdate))
+						{
+							if (!versionsToUpdate.Contains(nuGetPackage.Version))
+								versionsToUpdate.Add(nuGetPackage.Version);
+						}
+						else
+							packagesToSkip.Add(nuGetPackage.Name, [nuGetPackage.Version]);
+
+						if (detailed)
+							Console.WriteLine($"    SKIPPED: Full info for the package [{nuGetPackage.Name}] with version [{nuGetPackage.Version}] can't be received (target folder can't be located), packaged added to exclude list.");
+					}
 				}
 			}
+		}
+		catch (Exception ex)
+		{
+			LogError($"Exception during UpdatePackageInfoBasedOnNugetPackage method! Exception message: [{ex.Message}].");
 		}
 		finally
 		{
-			ClearAttributes(tempDir);
-			Directory.Delete(tempDir, true);
+			try
+			{
+				ClearAttributes(tempDir);
+				Directory.Delete(tempDir, true);
+			}
+			catch (Exception ex)
+			{
+				LogError($"Exception during removing the temp folder for the downloaded package by path [{tempDir}]! Exception message: [{ex.Message}].");
+			}
 		}
 	}
 
-	static void ApplyBindingRedirects(string[] csprojFiles, List<NuGetPackage> bindingRedirectVersions)
+	static void ApplyBindingRedirects(List<ProjectInfo> projectInfos)
 	{
-		// Get config file paths.
-		List<string> configFilePaths = [];
-		foreach (var csprojFile in csprojFiles)
+		Console.WriteLine($"{Environment.NewLine}Step 4: Apply binding redirects in app.config/web.config.");
+
+		foreach (ProjectInfo projectInfo in projectInfos)
 		{
-			string directoryPath = Path.GetDirectoryName(csprojFile);
+			// If the FullVersion is empty - the binding redirect for current package is not applyable -> skip it.
+			List<NuGetPackage> bindingRedirectVersionsToApply = projectInfo.UsedPackages
+				.Where(x => !string.IsNullOrEmpty(x.FullVersion))
+				.ToList();
 
-			string appConfigFilePath = Path.Combine(directoryPath, "app.config");
-			if (File.Exists(appConfigFilePath))
-				configFilePaths.Add(appConfigFilePath);
+			XNamespace ns = "urn:schemas-microsoft-com:asm.v1";
 
-			string webConfigFilePath = Path.Combine(directoryPath, "web.config");
-			if (File.Exists(webConfigFilePath))
-				configFilePaths.Add(webConfigFilePath);
-		}
-
-		// If the FullVersion is empty - the binding redirect for current package is not applyable -> skip it.
-		bindingRedirectVersions = bindingRedirectVersions
-			.Where(x => !string.IsNullOrEmpty(x.FullVersion))
-			.ToList();
-
-		XNamespace ns = "urn:schemas-microsoft-com:asm.v1";
-
-		foreach (string configFile in configFilePaths)
-		{
-			XDocument doc = XDocument.Load(configFile);
-
-			// Find all dependentAssembly nodes with bindingRedirects using the namespace.
-			IEnumerable<XElement> dependentAssemblyNodes = doc.Descendants(ns + "dependentAssembly");
-
-			bool fileChanged = false;
-
-			foreach (NuGetPackage bindingRedirect in bindingRedirectVersions)
+			foreach (string configFile in projectInfo.ConfigFilePaths)
 			{
-				// Find the specific dependentAssembly node by assemblyIdentity name.
-				XElement bindingRedirectNode = dependentAssemblyNodes
-					.FirstOrDefault(dependentAssembly =>
-						dependentAssembly.Element(ns + "assemblyIdentity")?.Attribute("name")?.Value == bindingRedirect.Name);
-
-				if (bindingRedirectNode != null)
+				try
 				{
-					// Get the existing version from the newVersion attribute.
-					string existingVersion = bindingRedirectNode.Element(ns + "bindingRedirect")?.Attribute("newVersion")?.Value;
-
-					// Check if the new version is greater than the existing one.
-					if (CompareVersions(bindingRedirect.FullVersion, existingVersion) > 0)
+					// we consider that this should be with projectInfo.ConfigFilePaths.Count == 0.
+					if (projectInfo.AddNewAppConfigFile)
 					{
-						// Update oldVersion attribute with a new top version
-						string oldVersion = bindingRedirectNode.Element(ns + "bindingRedirect")?.Attribute("oldVersion")?.Value;
-						if (!string.IsNullOrEmpty(oldVersion))
+						// we consider this case as a situation that we need to add an app.config file since the web.config file must always exist.
+						File.WriteAllText(configFile, DEFAULT_APP_CONFIG_CONTENT);
+						Console.WriteLine($"New file [{configFile}] created.");
+
+						s_rPathsToAdd.Add(configFile);
+					}
+
+					XDocument doc = XDocument.Load(configFile);
+
+					// Find or create the assemblyBinding element.
+					XElement assemblyBindingElement = doc.Descendants(ns + "assemblyBinding").FirstOrDefault();
+
+					if (assemblyBindingElement == null)
+					{
+						// If assemblyBinding doesn't exist, create it.
+						assemblyBindingElement = new XElement(ns + "assemblyBinding");
+						doc.Root?.Add(assemblyBindingElement);
+					}
+
+					// Find all dependentAssembly nodes with bindingRedirects using the namespace.
+					IEnumerable<XElement> dependentAssemblyNodes = doc.Descendants(ns + "dependentAssembly");
+
+					bool fileChanged = bindingRedirectVersionsToApply.Count != 0;
+
+					// Remove existing dependentAssembly elements.
+					dependentAssemblyNodes?.Remove();
+
+					foreach (NuGetPackage bindingRedirect in bindingRedirectVersionsToApply)
+					{
+						XElement newDependentAssembly = new(ns + "dependentAssembly",
+						new XElement("assemblyIdentity",
+						new XAttribute("name", bindingRedirect.Name),
+								new XAttribute("publicKeyToken", bindingRedirect.PublicKeyToken),
+								new XAttribute("culture", bindingRedirect.Culture)
+							),
+							new XElement("bindingRedirect",
+							new XAttribute("oldVersion", $"0.0.0.0-{bindingRedirect.FullVersion}"),
+									new XAttribute("newVersion", bindingRedirect.FullVersion)
+							)
+						);
+
+						// Add the new dependentAssembly element to the assemblyBinding element.
+						assemblyBindingElement?.Add(newDependentAssembly);
+					}
+
+					// Save the changes only if there are modifications.
+					if (fileChanged)
+					{
+						File.SetAttributes(configFile, FileAttributes.Normal);
+						using (StreamWriter streamWriter = new(configFile))
 						{
-							string[] versions = oldVersion.Split('-');
-							if (versions.Length > 1)
-							{
-								versions[1] = bindingRedirect.FullVersion;
-								bindingRedirectNode.Element(ns + "bindingRedirect")?.SetAttributeValue("oldVersion", string.Join("-", versions));
-							}
+							doc.Save(streamWriter);
+							streamWriter.Close();
 						}
+						//doc.Save(configFile);
 
-						// Update newVersion attribute.
-						bindingRedirectNode.Element(ns + "bindingRedirect")?.SetAttributeValue("newVersion", bindingRedirect.FullVersion);
+						Console.WriteLine($"Changes saved to [{configFile}].");
 
-						fileChanged = true;
+						if (!projectInfo.AddNewAppConfigFile)
+							s_rPathsToUpdate.Add(configFile);
+					}
+					else
+					{
+						Console.WriteLine($"No changes made to [{configFile}].");
 					}
 				}
-			}
-
-			// Save the changes only if there are modifications.
-			if (fileChanged)
-			{
-				doc.Save(configFile);
-				Console.WriteLine($"Changes saved to [{configFile}].");
-
-				s_rPathsToUpdate.Add(configFile);
-			}
-			else
-			{
-				Console.WriteLine($"No changes made to [{configFile}].");
+				catch (Exception ex)
+				{
+					LogError($"Exception during processing with [{configFile}] config! Exception message: [{ex.Message}].");
+				}
 			}
 		}
 	}
 
-	static void CheckOutChangedFIles(string tfToolPath)
+	static void CheckOutChangedFIles(string tfToolPath, bool detailed)
 	{
-		void __CheckOutFilesWithTF(string tfToolPath, string[] fileFullPaths)
+		void __ExecuteTFCommand(string tfToolPath, string command, string[] fileFullPaths, bool detailed)
 		{
-			string processArguments = $"checkout {string.Join(" ", fileFullPaths)}";
+			string processArguments = $"{command} {string.Join(" ", fileFullPaths)}";
+
+			if (detailed)
+				Console.WriteLine($"Executing the TF command: [{processArguments}].");
 
 			Process process = new();
 
@@ -601,27 +757,44 @@ class Program
 
 			process.WaitForExit();
 
-			//if (process.ExitCode != 0)
-			//{
-			//	throw new InvalidOperationException($"The command [{tfToolPath}] with arguments [{processArguments}] exited with error code {process.ExitCode}");
-			//}
+			if (process.ExitCode != 0)
+			{
+				LogError($"The command [{tfToolPath}] with arguments [{processArguments}] exited with error code {process.ExitCode}");
+				//throw new InvalidOperationException($"The command [{tfToolPath}] with arguments [{processArguments}] exited with error code {process.ExitCode}");
+			}
 		}
+
+		Console.WriteLine($"{Environment.NewLine}Step 5: Checkout/add files using TF.exe.");
 
 		if (!File.Exists(tfToolPath))
 			throw new InvalidOperationException($"Could not find command line tool [{tfToolPath}]!");
 
+		// checkout all changed files.
 		int cycles = (int)Math.Ceiling((double)s_rPathsToUpdate.Count / TF_ARGUMENT_BLOCK_SIZE);
-
 		for (int i = 0; i < cycles; i++)
 		{
-			int elementsToSkip = i * 100;
+			int elementsToSkip = i * TF_ARGUMENT_BLOCK_SIZE;
 
 			string[] fileFullPathsForCommand = s_rPathsToUpdate.Skip(elementsToSkip)
-				.Take(100)
+				.Take(TF_ARGUMENT_BLOCK_SIZE)
 				.Select(x => $"\"{x}\"")
 				.ToArray();
 
-			__CheckOutFilesWithTF(tfToolPath, fileFullPathsForCommand);
+			__ExecuteTFCommand(tfToolPath, "checkout", fileFullPathsForCommand, detailed);
+		}
+
+		// add all new files if any.
+		cycles = (int)Math.Ceiling((double)s_rPathsToAdd.Count / TF_ARGUMENT_BLOCK_SIZE);
+		for (int i = 0; i < cycles; i++)
+		{
+			int elementsToSkip = i * TF_ARGUMENT_BLOCK_SIZE;
+
+			string[] fileFullPathsForCommand = s_rPathsToAdd.Skip(elementsToSkip)
+				.Take(TF_ARGUMENT_BLOCK_SIZE)
+				.Select(x => $"\"{x}\"")
+				.ToArray();
+
+			__ExecuteTFCommand(tfToolPath, "add", fileFullPathsForCommand, detailed);
 		}
 	}
 
@@ -685,11 +858,100 @@ class Program
 		return parts1.Length.CompareTo(parts2.Length);
 	}
 
-	class NuGetPackage
+	static void LogError(string message)
+	{
+		Console.BackgroundColor = ConsoleColor.Red;
+		Console.WriteLine($"[ERROR]: {message}");
+		Console.ResetColor();
+	}
+
+	static void LogWarning(string message)
+	{
+		Console.BackgroundColor = ConsoleColor.DarkYellow;
+		Console.WriteLine($"[WARNING]: {message}");
+		Console.ResetColor();
+	}
+
+	public class NuGetPackage
 	{
 		public string Name { get; set; }
 		public string Version { get; set; }
 		public string FullVersion { get; set; }
-		public VersionRange SupportedVersions{ get; set; }
+		public VersionRange SupportedVersions { get; set; }
+		public string PublicKeyToken { get; set; }
+		public string Culture { get; set; }
+	}
+
+	public class PackageVersionInfo
+	{
+		public string Version { get; set; }
+		public string FullVersion { get; set; }
+		public string PublicKeyToken { get; set; }
+		public string Culture { get; set; }
+	}
+
+	public class ProjectInfo
+	{
+		public string Name { get; set; }
+		public string ProjectFilePath { get; set; }
+		public string AssetsFilePath { get; set; }
+		public List<string> ConfigFilePaths { get; set; } = [];
+		public bool AddNewAppConfigFile { get; set; }
+		public List<NuGetPackage> UsedPackages { get; set; }
+	}
+
+	public class Options
+	{
+		[Option('b', "basePath", Required = true, HelpText = "Base path")]
+		public string BasePath { get; set; }
+
+		[Option('t', "tfPath", Required = false, HelpText = "TF path")]
+		public string TfPath { get; set; }
+
+		[Option('d', "detailed", Required = false, Default = false, HelpText = "Enable detailed mode")]
+		public bool Detailed { get; set; }
+
+		[Option('d', "explicitVersion", Required = false, Default = false, HelpText = "If the version from the project.assets.json file should be " +
+			"explicitly assigned OR should package(s) version should be aligned for all projects from basePath")]
+		public bool ExplicitVersion { get; set; }
+	}
+
+	static void HandleParseError(IEnumerable<Error> errors)
+	{
+		Console.WriteLine("Failed to parse command line arguments.");
+
+		foreach (var error in errors)
+		{
+			switch (error.Tag)
+			{
+				case ErrorType.BadFormatTokenError:
+					Console.WriteLine($"Bad format token error: {error}");
+					break;
+				case ErrorType.HelpRequestedError:
+					Console.WriteLine("Help requested error.");
+					break;
+				case ErrorType.MissingValueOptionError:
+					Console.WriteLine($"Missing value for option: {error}");
+					break;
+				case ErrorType.NoVerbSelectedError:
+					Console.WriteLine("No verb selected error.");
+					break;
+				case ErrorType.RepeatedOptionError:
+					Console.WriteLine($"Repeated option error: {error}");
+					break;
+				case ErrorType.UnknownOptionError:
+					Console.WriteLine($"Unknown option error: {error}");
+					break;
+				case ErrorType.MissingRequiredOptionError:
+					Console.WriteLine($"Missing required option error: {error}");
+					break;
+				case ErrorType.BadVerbSelectedError:
+					Console.WriteLine($"Bad verb selected error: {error}");
+					break;
+				default:
+					Console.WriteLine($"Unknown error type: {error}");
+					break;
+			}
+		}
 	}
 }
