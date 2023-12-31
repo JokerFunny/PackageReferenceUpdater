@@ -648,6 +648,8 @@ class Program
 						Console.WriteLine($"New file [{configFile}] created.");
 
 						s_rPathsToAdd.Add(configFile);
+
+						// [TODO]: add a logic tpo check if app.config reference should be added to the csproj file.
 					}
 
 					XDocument doc = XDocument.Load(configFile);
